@@ -1,101 +1,137 @@
+# bet365_betway_arbitrage.py
+
+import re
+import math
+import numpy as np
 import pandas as pd
 from bs4 import BeautifulSoup
-import re
-import numpy as np
 from fractions import Fraction
 
-# Go to the websites, make sure to open all relevant sections we want to scrape, then download the page as a HTML file and use this for scraping
-bet365_file_path = r"C:\Users\zakaa\Downloads\Python Arbitrage\totlivbet365.html"
-betway_file_path = r"C:\Users\zakaa\Downloads\Python Arbitrage\Tottenham - Liverpool Betting Odds, Football Betting at Betway.html"
+# =========================================================
+# 0) CONFIG: set these to your saved HTML files
+# =========================================================
+bet365_file_path = r"C:\Users\AhmedZ\Downloads\whubre365.html"
+betway_file_path = r"C:\Users\AhmedZ\Downloads\whubrebw.html"
 
-# Bet365 Scraping
+# =========================================================
+# 1) BET365 SCRAPING — exact section titles (Over/Under cards)
+#    Returns dict with keys:
+#       Player_Shots_On_Target | Player_Total_Shots | Player_Fouls_Committed | Player_Tackles
+#    Each DataFrame: columns ["Player", "Over", "Under"] with values like "Under 0.5 4/6"
+# =========================================================
+
+BET365_EXACT_TITLES = {
+    "Player_Shots_On_Target": "Player Shots On Target Over/Under",
+    "Player_Total_Shots":     "Player Shots Over/Under",
+    "Player_Fouls_Committed": "Player Fouls Over/Under",
+    "Player_Tackles":         "Player Tackles Over/Under",
+}
+
+_FRACT_RE = re.compile(r"(?:\d+/\d+|EVS|Evens|EVENS)", re.I)
+
+def _norm_frac(s: str) -> str:
+    s = s.strip().upper()
+    return "1/1" if s in {"EVS", "EVENS"} else s.lower()
+
+def _title_of(mg):
+    t = mg.find("div", class_="gl-MarketGroup_Name")
+    if not t:
+        t = mg.find("div", class_="cm-MarketGroupWithIconsButton_Text")
+    return t.get_text(strip=True) if t else ""
+
+def _b365_extract_names(market_root):
+    return [
+        div.get_text(strip=True)
+        for div in market_root.find_all("div", class_="srb-ParticipantLabelWithTeam_Name")
+    ]
+
+def _b365_extract_cells(market_root):
+    """
+    Return ordered list of (handicap, odds) cells.
+    Prefer CenteredStacked (handicap + odds); fallback to odds-only if needed.
+    """
+    cells = []
+    for cell in market_root.find_all("div", class_="gl-ParticipantCenteredStacked"):
+        h = cell.find("span", class_="gl-ParticipantCenteredStacked_Handicap")
+        o = cell.find("span", class_="gl-ParticipantCenteredStacked_Odds")
+        if h and o:
+            cells.append((h.get_text(strip=True), o.get_text(strip=True)))
+    if not cells:
+        for oo in market_root.find_all("span", class_="gl-ParticipantOddsOnly_Odds"):
+            cells.append(("", oo.get_text(strip=True)))
+    return cells
+
+def _b365_extract_market_df(market_root, label_text: str):
+    """
+    Build DataFrame with columns: Player | {label_text}
+    Row example: "Over 0.5 10/11" or "Under 1.5 4/5".
+    """
+    names = _b365_extract_names(market_root)
+    cells = _b365_extract_cells(market_root)
+    n = min(len(names), len(cells))
+    rows = []
+    for i in range(n):
+        player = names[i]
+        hc, ov = cells[i]
+        rows.append({"Player": player, label_text: f"{label_text} {hc} {ov}".strip()})
+    return pd.DataFrame(rows, columns=["Player", label_text])
+
 def scrape_bet365(file_path):
-    # Function to clean text (remove BB and numbers before "Over")
-    def clean_text(text):
-        text = text.replace("BB", "")  # Remove 'BB'
-        text = text.replace("Over", " Over").replace("Under", " Under")  # Add space before "Over" and "Under"
-        parts = text.split(" Over", 1)
-        if len(parts) > 1:
-            parts[0] = re.sub(r'\d+', '', parts[0])  # Remove numbers
-            text = " Over".join(parts)
-        return text.strip()
-
-    # Function to split text into lines for better formatting
-    def split_text(input_text):
-        formatted_text = input_text.replace(" Over", "\nOver").replace(" Under", "\nUnder")
-        formatted_text = '\n'.join(line.rstrip() for line in formatted_text.split('\n'))
-        return f"\n{formatted_text}\n"
-
-    # Function to process a single section
-    def process_section(soup, start_phrase, end_phrase):
-        section_start = soup.find(string=start_phrase)
-        section_end = soup.find(string=end_phrase)
-
-        if not (section_start and section_end):
-            return None
-
-        # Extract section content
-        section_content = []
-        for sibling in section_start.find_all_next(string=True):
-            if sibling == section_end:
-                break
-            section_content.append(sibling.strip())
-
-        full_section_text = clean_text(" ".join(section_content).strip())
-        formatted_text = split_text(full_section_text)
-
-        # Parse the formatted text
-        lines = formatted_text.splitlines()
-        if len(lines) < 4:
-            return None  # Not enough lines to process
-
-        player_names = lines[1].split("   ")  # First line of names, separated by spaces
-        over_odds = lines[2].replace("Over", "").strip().split()
-        under_odds = lines[3].replace("Under", "").strip().split()
-
-        # Combine player names with their odds
-        data = []
-        for i, name in enumerate(player_names):
-            over_index = i * 2
-            under_index = i * 2
-
-            if over_index + 1 < len(over_odds) and under_index + 1 < len(under_odds):
-                data.append({
-                    "Player": name,
-                    "Over": f"{over_odds[over_index]} {over_odds[over_index + 1]}",
-                    "Under": f"{under_odds[under_index]} {under_odds[under_index + 1]}"
-                })
-
-        return pd.DataFrame(data)
-
     try:
         with open(file_path, 'r', encoding='utf-8') as html_file:
             soup = BeautifulSoup(html_file, 'html.parser')
 
-            # Define sections
-            sections = [
-                ("Player Shots On Target Over/Under", "Player Shots Over/Under"),
-                ("Player Shots Over/Under", "Player Fouls Committed"),
-                ("Player Fouls Committed", "Player Tackles"),
-                ("Player Tackles", "Player Passes"),
-            ]
+        market_groups = soup.find_all("div", class_="gl-MarketGroup")
+        out = {}
 
-            # Process each section and store the dataframes in a dictionary
-            dataframes = {}
-            for start_phrase, end_phrase in sections:
-                df = process_section(soup, start_phrase, end_phrase)
-                if df is not None:
-                    # Rename the dataframes according to the provided names
-                    if start_phrase == "Player Shots On Target Over/Under":
-                        dataframes["Player_Shots_On_Target"] = df
-                    elif start_phrase == "Player Shots Over/Under":
-                        dataframes["Player_Total_Shots"] = df
-                    elif start_phrase == "Player Fouls Committed":
-                        dataframes["Player_Fouls_Committed"] = df
-                    elif start_phrase == "Player Tackles":
-                        dataframes["Player_Tackles"] = df
+        # For each exact market title T, look for exact cards:
+        #   T,  T - Over,  T - Under
+        for key_name, exact_title in BET365_EXACT_TITLES.items():
+            over_df = under_df = combined_df = None
 
-            return dataframes
+            for mg in market_groups:
+                title = _title_of(mg)
+                if title == exact_title + " - Over":
+                    over_df = _b365_extract_market_df(mg, "Over")
+                elif title == exact_title + " - Under":
+                    under_df = _b365_extract_market_df(mg, "Under")
+                elif title == exact_title:
+                    combined_df = _b365_extract_market_df(mg, "Over_Under_RAW")
+
+                if over_df is not None and under_df is not None:
+                    break
+
+            if over_df is None and under_df is None and combined_df is not None:
+                # Split combined card into Over/Under halves by number of names/cells
+                names = combined_df["Player"].tolist()
+                mg_combined = next((mg for mg in market_groups if _title_of(mg) == exact_title), None)
+                if mg_combined:
+                    cells = _b365_extract_cells(mg_combined)
+                    N = len(names)
+                    if N and len(cells) >= 2 * N:
+                        over_cells = cells[:N]
+                        under_cells = cells[N:2 * N]
+                        over_df = pd.DataFrame({
+                            "Player": names,
+                            "Over": [f"Over {h} {o}".strip() for (h, o) in over_cells]
+                        })
+                        under_df = pd.DataFrame({
+                            "Player": names,
+                            "Under": [f"Under {h} {o}".strip() for (h, o) in under_cells]
+                        })
+
+            if over_df is not None and "Over" in over_df.columns and under_df is not None and "Under" in under_df.columns:
+                merged = pd.merge(over_df, under_df, on="Player", how="inner")
+            elif over_df is not None:
+                merged = over_df.copy(); merged["Under"] = ""
+            elif under_df is not None:
+                merged = under_df.copy(); merged["Over"] = ""
+            else:
+                merged = pd.DataFrame(columns=["Player", "Over", "Under"])
+
+            out[key_name] = merged[["Player", "Over", "Under"]]
+
+        return out
 
     except FileNotFoundError:
         print(f"Error: The file at {file_path} was not found.")
@@ -104,339 +140,218 @@ def scrape_bet365(file_path):
         print(f"An error occurred: {e}")
         return {}
 
-# Betway Scraping
+# =========================================================
+# 2) BETWAY SCRAPING — paired-row table layout
+#    Returns dict of DataFrames keyed by exact section title strings:
+#       "Player To Have 1+ Shots", "Player To Have 2+ Shots", ...,
+#       "Player To Have 1+ Shots On Target", ...
+# =========================================================
+
 def scrape_betway(html_file_path):
-    with open(html_file_path, "r", encoding="utf-8") as file:
-        html_content = file.read()
-
-    soup = BeautifulSoup(html_content, "html.parser")
-    all_text = soup.get_text(separator="\n", strip=True)
-
-    start_marker = "Player To Have"
-    end_marker = "Player To Score Or Assist"
-    lines = all_text.splitlines()
-
-    sections = []
-    section_names = []
-    current_section_name = ""
-    current_section_text = []
-    inside_section = False
-
-    for line in lines:
-        if line.startswith(start_marker):
-            if current_section_name:
-                sections.append((current_section_name, "\n".join(current_section_text)))
-            current_section_name = line.strip()
-            section_names.append(current_section_name)
-            current_section_text = []
-            inside_section = True
-        elif end_marker in line and inside_section:
-            sections.append((current_section_name, "\n".join(current_section_text)))
-            inside_section = False
-        if inside_section:
-            current_section_text.append(line.strip())
+    with open(html_file_path, "r", encoding="utf-8") as f:
+        soup = BeautifulSoup(f.read(), "html.parser")
 
     dataframes = {}
-    for section_name, section_content in sections:
-        cleaned_lines = [
-            line.replace("Cash Out", "").strip()
-            for line in section_content.splitlines() if "Suspended" not in line
-        ]
-        cleaned_lines = cleaned_lines[3:] if len(cleaned_lines) > 3 else []
+
+    # Each market has a header: [data-testid="table-header-title"]
+    for header in soup.select('[data-testid="table-header"] [data-testid="table-header-title"]'):
+        section_title = header.get_text(strip=True)
+        if not section_title.startswith("Player To Have"):
+            continue
+
+        # Table lives in the same market-table-section
+        section = header.find_parent(attrs={"data-testid": "market-table-section"})
+        if not section:
+            continue
+        table = section.select_one("table")  # class names change; tag stays table
+        if not table:
+            continue
+
+        rows = table.select("tbody > tr")
         players, actions, odds = [], [], []
 
-        for i in range(0, len(cleaned_lines), 2):
-            if i + 1 < len(cleaned_lines):
-                players.append(cleaned_lines[i])
-                actions.append(section_name)
-                odds.append(cleaned_lines[i + 1])
+        i = 0
+        while i < len(rows):
+            # Row of two names
+            name_cells = rows[i].select("td")
+            left_name = name_cells[0].get_text(strip=True) if len(name_cells) >= 1 else ""
+            right_name = name_cells[1].get_text(strip=True) if len(name_cells) >= 2 else ""
 
-        # Create a DataFrame for the section and store it in the dictionary with the section name
-        df = pd.DataFrame({'Player Name': players, 'Action': actions, 'Odds': odds})
-        dataframes[section_name] = df
+            # Next row: two odds buttons
+            left_odds = right_odds = ""
+            if i + 1 < len(rows):
+                odds_cells = rows[i+1].select("td")
+
+                def extract_price(td):
+                    # Prefer explicit price span
+                    span = td.select_one('[data-testid="outcome-price-value"]')
+                    if span and span.get_text(strip=True):
+                        return span.get_text(strip=True)
+                    # Fallback to attribute (e.g., "Callum Wilson 3/8")
+                    btn = td.select_one('[data-testid="outcome"]')
+                    if btn and btn.has_attr("data-outcomename"):
+                        m = re.search(r'(\d+/\d+)', btn["data-outcomename"])
+                        if m:
+                            return m.group(1)
+                    return ""
+
+                if len(odds_cells) >= 1:
+                    left_odds = extract_price(odds_cells[0])
+                if len(odds_cells) >= 2:
+                    right_odds = extract_price(odds_cells[1])
+
+            # Append valid pairs
+            if left_name and left_odds:
+                players.append(left_name); actions.append(section_title); odds.append(left_odds)
+            if right_name and right_odds:
+                players.append(right_name); actions.append(section_title); odds.append(right_odds)
+
+            i += 2  # advance to next pair
+
+        df = pd.DataFrame({"Player Name": players, "Action": actions, "Odds": odds})
+        dataframes[section_title] = df
 
     return dataframes
 
-# Scrape Bet365
-bet365_dataframes = scrape_bet365(bet365_file_path)
-print("Bet365 Data:")
-for section_name, df in bet365_dataframes.items():
-    print(f"{section_name}")
-    print(df)
-    print("\n" + "=" * 50 + "\n")
-
-# Scrape Betway
-print("Betway Data:")
-
-# Open and read the HTML file
-with open(betway_file_path, "r", encoding="utf-8") as file:
-    html_content = file.read()
-
-# Parse the HTML content using BeautifulSoup
-soup = BeautifulSoup(html_content, "html.parser")
-
-# Extract all visible text
-all_text = soup.get_text(separator="\n", strip=True)
-
-# Define the markers
-start_marker = "Player To Have"
-end_marker = "Player To Score Or Assist"
-
-# Split the text into lines for easier processing
-lines = all_text.splitlines()
-
-# Temporary variables to hold the current section name and content
-sections = []
-section_names = []  # List to hold the section names
-current_section_name = ""
-current_section_text = []
-inside_section = False
-
-# Iterate through lines to detect and extract text between the markers
-for line in lines:
-    if line.startswith(start_marker):
-        # If the line starts with "Player To Have", it's a new section name
-        if current_section_name:
-            sections.append((current_section_name, "\n".join(current_section_text)))  # Store the previous section content
-        current_section_name = line.strip()  # Capture the new section name
-        section_names.append(current_section_name)  # Add section name to the list
-        current_section_text = []  # Reset the content for the new section
-        inside_section = True
-
-    elif end_marker in line and inside_section:
-        # Stop capturing text once we hit the end marker
-        sections.append((current_section_name, "\n".join(current_section_text)))  # Store the last section content
-        inside_section = False
-
-    if inside_section:
-        # Add the line to the current section's content
-        current_section_text.append(line.strip())
-
-# Initialize the global dictionary to store the cleaned DataFrames
-betway_dataframes = {}
-
-# Clean and format the sections into a table
-for section_name, section_content in sections:
-    # Clean the section content
-    cleaned_section_content = section_content.replace("Cash Out", "")
-
-    # Remove lines containing "Suspended"
-    cleaned_lines = [
-        line for line in cleaned_section_content.splitlines() if "Suspended" not in line
-    ]
-
-    # Remove the section name from the content, if it appears
-    cleaned_section_content = "\n".join(cleaned_lines).replace(section_name, "").strip()
-
-    # Remove the first three lines
-    cleaned_lines = cleaned_section_content.splitlines()[2:]  # Skip the first three lines
-    cleaned_section_content = "\n".join(cleaned_lines)
-
-    # Identify and remove the first line of consecutive lines of just text
-    final_lines = []
-    prev_line_is_text = False
-
-    for line in cleaned_section_content.splitlines():
-        if line and not any(char.isdigit() for char in line):  # If the line is just text (no numbers)
-            if prev_line_is_text:
-                # Remove the previous line (the first of the consecutive lines)
-                final_lines.pop()
-            prev_line_is_text = True
-        else:
-            prev_line_is_text = False
-
-        final_lines.append(line)
-
-    # Create the table for each section
-    players = []
-    actions = []
-    odds = []
-
-    # Pair up players and odds
-    for i in range(0, len(final_lines), 2):
-        if i + 1 < len(final_lines):
-            player_name = final_lines[i].strip()
-            player_odds = final_lines[i + 1].strip()
-            players.append(player_name)
-            actions.append(section_name)
-            odds.append(player_odds)
-
-    # Create a DataFrame for the section
-    df = pd.DataFrame({
-        'Player Name': players,
-        'Action': actions,
-        'Odds': odds
-    })
-
-    # Add the cleaned DataFrame to the global dictionary
-    betway_dataframes[section_name] = df
-
-    # Print the table for this section
-    print(f"{section_name}\n")
-    print(df)
-    print("\n" + "-" * 80 + "\n")
+# =========================================================
+# 3) ARBITRAGE HELPERS (unchanged math; safer parsing)
+# =========================================================
 
 def multiply_fractions(fraction1, fraction2):
-    """Multiply two fractional odds and return the result as a fraction."""
     try:
         frac1 = Fraction(fraction1)
         frac2 = Fraction(fraction2)
         return frac1 * frac2
-    except ValueError:
+    except Exception:
         return None
 
-# Function to convert fractional odds to decimal
 def fractional_to_decimal(fraction):
+    if fraction.upper().startswith("EV"):
+        return 2.0
     num, denom = map(int, fraction.split("/"))
     return 1 + (num / denom)
 
-# Function to calculate the arbitrage ROI
 def calculate_arbitrage_roi(stake, odds1, odds2):
-    """
-    Calculate the guaranteed ROI for an arbitrage opportunity.
-
-    Parameters:
-        stake (float): Total stake (e.g., £100).
-        odds1 (str): Fractional odds for the first outcome (e.g., "2/11").
-        odds2 (str): Fractional odds for the second outcome (e.g., "6/1").
-
-    Returns:
-        float: ROI percentage.
-        float: Stake on Bet365.
-        float: Stake on Betway 
-        float: Total profit.
-    """
-    # Convert fractional odds to decimals
-    decimal1 = fractional_to_decimal(odds1)
-    decimal2 = fractional_to_decimal(odds2)
-
-    # Calculate stakes for equal payouts
-    stake1 = (decimal2 / (decimal1 + decimal2)) * stake
+    d1 = fractional_to_decimal(odds1)
+    d2 = fractional_to_decimal(odds2)
+    stake1 = (d2 / (d1 + d2)) * stake
     stake2 = stake - stake1
-
-    # Guaranteed payout
-    payout = stake1 * decimal1  # or stake2 * decimal2, they will be the same
-
-    # Calculate total profit
+    payout = stake1 * d1
     total_profit = payout - stake
-
-    # ROI calculation
     roi = (total_profit / stake) * 100
     return roi, stake1, stake2, total_profit
 
-# Step 1: Access the Bet365 Player_Shots_On_Target dataframe
-bet365_player_shots_on_target = bet365_dataframes["Player_Shots_On_Target"]
+# Parse "Under 0.5 4/6" (or "Under 1.5 EVS")
+def parse_under_parts(under_text: str):
+    m_num = re.search(r"(\d+(?:\.\d+)?)", under_text)
+    m_frac = re.search(r"(\d+/\d+|EVS|Evens|EVENS)", under_text, flags=re.I)
+    if not m_num or not m_frac:
+        return None, None
+    thresh = float(m_num.group(1))
+    frac = m_frac.group(1)
+    if frac.upper().startswith("EV"):
+        frac = "1/1"
+    return thresh, frac
 
-# Step 2: Iterate over all players in the Bet365 Player_Shots_On_Target dataframe
-for _, row in bet365_player_shots_on_target.iterrows():
-    player_name = row['Player']
-    under_odds = row['Under']
+# =========================================================
+# 4) RUN SCRAPERS
+# =========================================================
+bet365_dataframes = scrape_bet365(bet365_file_path)
+print("Bet365 Data:")
+for section_name, df in bet365_dataframes.items():
+    print(section_name)
+    print(df.head(30))
+    print("\n" + "=" * 50 + "\n")
 
-    # Skip if under odds are missing or not in the expected format
-    if not under_odds or ' ' not in under_odds:
-        continue
+betway_dataframes = scrape_betway(betway_file_path)
+print("Betway Data:")
+for section_name, df in betway_dataframes.items():
+    print(section_name)
+    print(df.head(30))
+    print("\n" + "-" * 80 + "\n")
 
-    # Extract the decimal and fractional parts of the "Under" column
-    try:
-        decimal_number = float(under_odds.split()[0])  # First part is the decimal number
-        fractional_odds = under_odds.split()[1]  # Second part is the fractional odds
-    except (ValueError, IndexError):
-        continue
+# =========================================================
+# 5) ARBITRAGE SCAN
+#    Strategy: Bet365 "Under X.5" vs Betway "Player To Have N+ Shots(/On Target)"
+# =========================================================
 
-    # Round up the decimal number
-    rounded_up_number = int(np.ceil(decimal_number))
-    rounded_up_number_str = str(rounded_up_number)
+# --- Shots On Target ---
+if "Player_Shots_On_Target" in bet365_dataframes:
+    bet365_player_shots_on_target = bet365_dataframes["Player_Shots_On_Target"]
+    for _, row in bet365_player_shots_on_target.iterrows():
+        player_name = row['Player']
+        under_odds_text = row['Under']
+        if not isinstance(under_odds_text, str) or not under_odds_text:
+            continue
 
-    # Step 3: Search for the matching Betway section for "Shots On Target"
-    betway_match_found = False
-    for section_name, betway_df in betway_dataframes.items():
-        if f"Player To Have {rounded_up_number_str}+ Shots On Target" in section_name:
-            # Clean up player names in the Betway dataframe for consistent matching
-            betway_df['Player Name'] = betway_df['Player Name'].str.strip()
+        thresh, fractional_odds = parse_under_parts(under_odds_text)
+        if thresh is None or fractional_odds is None:
+            continue
 
-            # Find the row in the Betway dataframe for the current player
-            betway_row = betway_df[betway_df['Player Name'] == player_name]
+        rounded_up_number = int(np.ceil(thresh))
+        target_section = f"Player To Have {rounded_up_number}+ Shots On Target"
 
-            if not betway_row.empty:
-                # Multiply fractional odds
-                product_fraction = multiply_fractions(fractional_odds, betway_row['Odds'].iloc[0])
+        betway_df = betway_dataframes.get(target_section)
+        if betway_df is None or betway_df.empty:
+            continue
 
-                # Check if there is an arbitrage opportunity
-                if product_fraction and product_fraction > 1:
-                    # Calculate the arbitrage ROI
-                    stake = 100  # Assume a £100 stake for the calculation
-                    roi, stake1, stake2, total_profit = calculate_arbitrage_roi(stake, fractional_odds, betway_row['Odds'].iloc[0])
-                    
-                    # Print only if there is an arbitrage opportunity
-                    print(f"ARBITRAGE OPPORTUNITY! - Shots On Target")
-                    print(f"Player: {player_name}")
-                    print(f"Bet365 'Under' Odds: {fractional_odds}")
-                    print(f"Betway Odds: {betway_row['Odds'].iloc[0]}")
-                    print(f"Guaranteed ROI: {roi:.2f}%")
-                    print(f"Suggested bet on Bet365: £{stake1:.2f}")
-                    print(f"Suggested bet on Betway: £{stake2:.2f}")
-                    print(f"Total Profit with £100 wallet: £{total_profit:.2f}")
-                    print("-" * 40)
-                betway_match_found = True
-                break
+        # exact name match after stripping whitespace
+        match = betway_df.loc[betway_df['Player Name'].str.strip() == player_name]
+        if match.empty:
+            continue
 
-    # Step 4: Handle case where no match is found (no output if no arbitrage)
-    if not betway_match_found:
-        continue
+        betway_fractional = match.iloc[0]['Odds']
+        product_fraction = multiply_fractions(fractional_odds, betway_fractional)
 
-# Step 1: Access the Bet365 Player_Total_Shots dataframe
-bet365_player_total_shots = bet365_dataframes["Player_Total_Shots"]
+        if product_fraction and product_fraction > 1:
+            roi, stake1, stake2, total_profit = calculate_arbitrage_roi(100, fractional_odds, betway_fractional)
+            print(f"ARBITRAGE OPPORTUNITY! - Shots On Target")
+            print(f"Player: {player_name}")
+            print(f"Bet365 'Under' Odds: {fractional_odds}")
+            print(f"Betway Odds: {betway_fractional}")
+            print(f"Guaranteed ROI: {roi:.2f}%")
+            print(f"Suggested bet on Bet365: £{stake1:.2f}")
+            print(f"Suggested bet on Betway: £{stake2:.2f}")
+            print(f"Total Profit with £100 wallet: £{total_profit:.2f}")
+            print("-" * 40)
 
-# Step 2: Iterate over all players in the Bet365 Player_Total_Shots dataframe
-for _, row in bet365_player_total_shots.iterrows():
-    player_name = row['Player']
-    under_odds = row['Under']
+# --- Total Shots ---
+if "Player_Total_Shots" in bet365_dataframes:
+    bet365_player_total_shots = bet365_dataframes["Player_Total_Shots"]
+    for _, row in bet365_player_total_shots.iterrows():
+        player_name = row['Player']
+        under_odds_text = row['Under']
+        if not isinstance(under_odds_text, str) or not under_odds_text:
+            continue
 
-    # Skip if under odds are missing or not in the expected format
-    if not under_odds or ' ' not in under_odds:
-        continue
+        thresh, fractional_odds = parse_under_parts(under_odds_text)
+        if thresh is None or fractional_odds is None:
+            # Optional debug:
+            # print(f"Error parsing Under odds for Player: {player_name}, Odds: {under_odds_text}")
+            continue
 
-    # Extract the decimal and fractional parts of the "Under" column
-    try:
-        decimal_number = float(under_odds.split()[0])  # First part is the decimal number
-        fractional_odds = under_odds.split()[1]  # Second part is the fractional odds
-    except (ValueError, IndexError):
-        print(f"Error parsing Under odds for Player: {player_name}, Odds: {under_odds}")
-        continue
+        rounded_up_number = int(np.ceil(thresh))
+        target_section = f"Player To Have {rounded_up_number}+ Shots"
 
-    # Round up the decimal number
-    rounded_up_number = int(np.ceil(decimal_number))
-    rounded_up_number_str = str(rounded_up_number)
+        betway_df = betway_dataframes.get(target_section)
+        if betway_df is None or betway_df.empty:
+            continue
 
-    # Step 3: Search for the matching Betway section for "Shots"
-    betway_match_found = False
-    for section_name, betway_df in betway_dataframes.items():
-        if section_name == f"Player To Have {rounded_up_number_str}+ Shots":
-            # Clean up player names in the Betway dataframe for consistent matching
-            betway_df['Player Name'] = betway_df['Player Name'].str.strip()
+        match = betway_df.loc[betway_df['Player Name'].str.strip() == player_name]
+        if match.empty:
+            continue
 
-            # Find the row in the Betway dataframe for the current player
-            betway_row = betway_df[betway_df['Player Name'] == player_name]
+        betway_fractional = match.iloc[0]['Odds']
+        product_fraction = multiply_fractions(fractional_odds, betway_fractional)
 
-            if not betway_row.empty:
-                # Multiply fractional odds
-                product_fraction = multiply_fractions(fractional_odds, betway_row['Odds'].iloc[0])
-
-                # Check if there is an arbitrage opportunity
-                if product_fraction and product_fraction > 1:
-                    # Print Bet365 and Betway match
-                    print(f"ARBITRAGE OPPORTUNITY! - Shots")
-                    print(f"Player: {player_name}")
-                    print(f"Bet365 'Under' Odds: {fractional_odds}")
-                    print(f"Betway Odds: {betway_row['Odds'].iloc[0]}")
-                    # Calculate the arbitrage ROI
-                    stake = 100  # Assume a £100 stake for the calculation
-                    roi, stake1, stake2, total_profit = calculate_arbitrage_roi(stake, fractional_odds, betway_row['Odds'].iloc[0])
-                    print(f"Guaranteed ROI: {roi:.2f}%")
-                    print(f"Suggested Bet on Bet365: £{stake1:.2f}")
-                    print(f"Suggested Bet on Betway: £{stake2:.2f}")
-                    print(f"Total Profit with £100 wallet: £{total_profit:.2f}")
-                    print("-" * 40)
-
-                betway_match_found = True
-                break
+        if product_fraction and product_fraction > 1:
+            roi, stake1, stake2, total_profit = calculate_arbitrage_roi(100, fractional_odds, betway_fractional)
+            print(f"ARBITRAGE OPPORTUNITY! - Shots")
+            print(f"Player: {player_name}")
+            print(f"Bet365 'Under' Odds: {fractional_odds}")
+            print(f"Betway Odds: {betway_fractional}")
+            print(f"Guaranteed ROI: {roi:.2f}%")
+            print(f"Suggested Bet on Bet365: £{stake1:.2f}")
+            print(f"Suggested Bet on Betway: £{stake2:.2f}")
+            print(f"Total Profit with £100 wallet: £{total_profit:.2f}")
+            print("-" * 40)
